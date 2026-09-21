@@ -24,4 +24,5 @@ candle-nn = { path = "../candle-nn", features = ["cuda"] }
 
 [features]
 default = []
+static-linking = ["candle/cuda-static-linking"]
 cudnn = ["candle/cudnn"]
