@@ -75,6 +75,8 @@ fn main() -> Result<()> {
     println!("cargo:rustc-link-search={}", out_dir.display());
     println!("cargo:rustc-link-lib=moe");
     if env::var_os("CARGO_FEATURE_STATIC_LINKING").is_some() {
+        let toolkit = cudaforge::CudaToolkit::detect()?;
+        println!("cargo:rustc-link-search=native={}", toolkit.lib_dir.display());
         println!("cargo:rustc-link-lib=static=cudart_static");
     } else {
         println!("cargo:rustc-link-lib=dylib=cudart");
