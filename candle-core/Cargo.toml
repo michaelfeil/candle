@@ -47,6 +47,10 @@ criterion = { workspace = true }
 [features]
 default = []
 cuda = ["cudarc", "dep:candle-kernels"]
+# Explicit linking modes override cudarc's default dynamic loading. They are
+# mutually exclusive, so static consumers must disable any dynamic-linking defaults.
+cuda-dynamic-linking = ["cuda", "cudarc/dynamic-linking"]
+cuda-static-linking = ["cuda", "cudarc/static-linking", "candle-kernels/static-linking"]
 cutile = ["cuda", "dep:cutile"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]
