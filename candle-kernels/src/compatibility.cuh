@@ -7,7 +7,8 @@
 
 // FIXME: the minimum compute capabilities are just guesses since the table is not specific enough
 
-#if __CUDA_ARCH__ < 800
+// CUDA 12.9 provides these helpers for pre-Ampere GPUs too.
+#if __CUDA_ARCH__ < 800 && CUDART_VERSION < 12090
 __device__ __forceinline__ __half __hmax_nan(__half a, __half b) {
     return __hisnan(a) ? a : (__hisnan(b) ? b : __hmax(a, b));
 }
