@@ -8,7 +8,7 @@ use candle_nn::{Activation, Linear, VarBuilder};
 
 use super::config::Gemma4VisionConfig;
 
-// ── RmsNorm (Gemma-style) ───────────────────────────────────────────────────
+// ── RmsNorm (Gemma4 scale, without a +1 offset) ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct RmsNorm {
@@ -35,8 +35,8 @@ impl Module for RmsNorm {
         let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
         let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
         x_normed
-            .to_dtype(x_dtype)?
-            .broadcast_mul(&(&self.weight + 1.0)?)
+            .broadcast_mul(&self.weight.to_dtype(internal_dtype)?)?
+            .to_dtype(x_dtype)
     }
 }
 
@@ -153,7 +153,7 @@ impl PatchEmbedder {
         let patches = ((patches - 0.5)? * 2.0)?;
 
         // Linear projection
-        let patches = self.input_proj.forward(&patches)?;
+        let patches = self.input_proj.forward(&patches.to_dtype(self.input_proj.weight().dtype())?)?;
 
         // Position embeddings via index_select
         let clamped_pos = patch_positions.clamp(0i64, i64::MAX)?;
@@ -416,7 +416,7 @@ impl VisionPooler {
             .to_dtype(original_dtype)?;
 
         // Scale by sqrt(hidden_size)
-        output * (self.hidden_size as f64).sqrt()
+        output.to_dtype(DType::F32)? * (self.hidden_size as f64).sqrt()
     }
 
     fn forward(
@@ -427,7 +427,7 @@ impl VisionPooler {
     ) -> Result<Tensor> {
         let output_length = output_length.unwrap_or(self.default_output_length);
         if hidden_states.dim(1)? == output_length {
-            Ok((hidden_states.clone() * (self.hidden_size as f64).sqrt())?)
+            hidden_states.to_dtype(DType::F32)? * (self.hidden_size as f64).sqrt()
         } else {
             self.avg_pool_by_positions(hidden_states, patch_positions, output_length)
         }
@@ -486,7 +486,7 @@ impl VisionTower {
     }
 
     /// Encode a single image at its natural resolution.
-    fn encode_single(&self, pv: &Tensor, device: &Device, dtype: DType) -> Result<Tensor> {
+    fn encode_single(&self, pv: &Tensor, device: &Device) -> Result<Tensor> {
         let (_, _, h, w) = pv.dims4()?;
         let ph = h / self.patch_size;
         let pw = w / self.patch_size;
@@ -507,8 +507,8 @@ impl VisionTower {
 
         // 2D RoPE
         let (cos, sin) = self.rotary_emb.forward(&positions)?;
-        let cos = cos.to_dtype(dtype)?;
-        let sin = sin.to_dtype(dtype)?;
+        let cos = cos.to_dtype(embeds.dtype())?;
+        let sin = sin.to_dtype(embeds.dtype())?;
 
         let mut hidden_states = embeds;
         for layer in &self.encoder_layers {
@@ -528,11 +528,11 @@ impl VisionTower {
     /// Encode a batch of images (each may have different sizes).
     pub fn forward(&self, pixel_values_list: &[Tensor]) -> Result<Tensor> {
         let device = pixel_values_list[0].device().clone();
-        let dtype = pixel_values_list[0].dtype();
+        let dtype = self.patch_embedder.input_proj.weight().dtype();
 
         let mut all_tokens = Vec::with_capacity(pixel_values_list.len());
         for pv in pixel_values_list {
-            let tokens = self.encode_single(pv, &device, dtype)?;
+            let tokens = self.encode_single(pv, &device)?;
             all_tokens.push(tokens);
         }
         let mut hidden_states = Tensor::cat(&all_tokens, 0)?;
@@ -547,6 +547,6 @@ impl VisionTower {
             hidden_states = (hidden_states.broadcast_sub(&std_bias)?).broadcast_mul(&std_scale)?;
         }
 
-        hidden_states.unsqueeze(0)
+        hidden_states.to_dtype(dtype)?.unsqueeze(0)
     }
 }
