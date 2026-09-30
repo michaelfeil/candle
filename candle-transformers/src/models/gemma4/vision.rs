@@ -153,7 +153,9 @@ impl PatchEmbedder {
         let patches = ((patches - 0.5)? * 2.0)?;
 
         // Linear projection
-        let patches = self.input_proj.forward(&patches.to_dtype(self.input_proj.weight().dtype())?)?;
+        let patches = self
+            .input_proj
+            .forward(&patches.to_dtype(self.input_proj.weight().dtype())?)?;
 
         // Position embeddings via index_select
         let clamped_pos = patch_positions.clamp(0i64, i64::MAX)?;
@@ -260,10 +262,29 @@ impl VisionAttention {
         let k = crate::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
         let v = crate::utils::repeat_kv(v, self.num_kv_groups)?.contiguous()?;
 
-        // Scaled dot-product attention (scale = 1.0 since Q is already normalized)
-        let attn_weights = q.matmul(&k.transpose(2, 3)?)?;
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        // Preserve SDPA's float32 accumulation; rounding QK/softmax to BF16
+        // here causes visible drift after pooling and standardization.
+        let attention = || -> Result<Tensor> {
+            #[cfg(feature = "flash-attn")]
+            if q.device().is_cuda() && matches!(q.dtype(), DType::F16 | DType::BF16) {
+                return candle_flash_attn::flash_attn(
+                    &q.transpose(1, 2)?.contiguous()?,
+                    &k.transpose(1, 2)?.contiguous()?,
+                    &v.transpose(1, 2)?.contiguous()?,
+                    1.0,
+                    false,
+                )?
+                .transpose(1, 2);
+            }
+            let dtype = q.dtype();
+            let weights = q
+                .to_dtype(DType::F32)?
+                .matmul(&k.to_dtype(DType::F32)?.transpose(2, 3)?)?;
+            candle_nn::ops::softmax_last_dim(&weights)?
+                .matmul(&v.to_dtype(DType::F32)?)?
+                .to_dtype(dtype)
+        };
+        let attn_output = attention()?;
 
         attn_output
             .transpose(1, 2)?
