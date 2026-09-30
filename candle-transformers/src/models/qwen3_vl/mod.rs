@@ -8,7 +8,7 @@ use vision::Qwen3VLVisionModel;
 pub mod config;
 mod conv3d_temporal_2;
 mod text;
-mod vision;
+pub mod vision;
 
 pub use config::Config;
 
