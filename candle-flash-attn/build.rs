@@ -160,11 +160,9 @@ fn main() -> Result<()> {
 
     println!("cargo::rustc-link-search={}", build_dir.display());
     println!("cargo::rustc-link-lib=flashattention");
-    if std::env::var_os("CARGO_FEATURE_STATIC_LINKING").is_some() {
-        let toolkit = cudaforge::CudaToolkit::detect()?;
-        println!("cargo::rustc-link-search=native={}", toolkit.lib_dir.display());
-        println!("cargo::rustc-link-lib=static=cudart_static");
-    } else {
+    // The static-linking feature forwards to candle/cuda-static-linking, which
+    // supplies cudart through cudarc. Linking it here too duplicates its symbols.
+    if std::env::var_os("CARGO_FEATURE_STATIC_LINKING").is_none() {
         println!("cargo::rustc-link-lib=dylib=cudart");
     }
     if !is_target_msvc {
