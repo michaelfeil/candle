@@ -202,6 +202,8 @@ __device__ void rmsnorm_f32_math(const T *x, T *dst, const T *alpha,
         if (tid < stride) sums[tid] = __fadd_rn(sums[tid], sums[tid + stride]);
     }
     __syncthreads();
+    // Tensor / f64 lowers to affine(1.0 / ncols, 0.0), then casts that
+    // reciprocal to f32. Preserve scalar division semantics rather than x / float(ncols).
     const float variance = __fadd_rn(
         __fmul_rn(sums[0], static_cast<float>(1.0 / static_cast<double>(ncols))), eps);
     const float denominator = sqrtf(variance);

@@ -717,6 +717,9 @@ pub fn rms_norm_f32(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
             alpha.shape()
         )
     }
+    if xs.elem_count() == 0 {
+        return Ok(xs.clone());
+    }
     if xs.device().is_cuda() && matches!(xs.dtype(), DType::F16 | DType::BF16 | DType::F32) {
         return xs.apply_op2_no_bwd(
             alpha,

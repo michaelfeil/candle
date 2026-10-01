@@ -85,6 +85,14 @@ fn rms_norm_f32_math(device: &Device) -> Result<()> {
                 .map(|i| {
                     if i < 2 * cols {
                         0.
+                    } else if i / cols == 2 {
+                        // Sum 17 distinguishes rounded reciprocal multiplication from
+                        // float32 division at widths 72 and 1152.
+                        if i % cols < 17 {
+                            1.
+                        } else {
+                            0.
+                        }
                     } else {
                         ((i * 31 % 199) as f32 - 99.) / 33.
                     }
@@ -117,6 +125,14 @@ fn rms_norm_f32_math(device: &Device) -> Result<()> {
                 "{dtype:?} width {cols}"
             );
         }
+    }
+    for shape in [(0, 72), (0, 1152)] {
+        let empty = Tensor::zeros(shape, DType::F32, device)?;
+        let alpha = Tensor::ones(shape.1, DType::F32, device)?;
+        assert_eq!(
+            candle_nn::ops::rms_norm_f32(&empty, &alpha, 1e-6)?.dims(),
+            empty.dims()
+        );
     }
     assert!(candle_nn::ops::rms_norm_f32(
         &Tensor::zeros((1, 0), candle::DType::F32, device)?,
