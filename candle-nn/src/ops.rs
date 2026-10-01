@@ -441,6 +441,7 @@ pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
 #[derive(Debug, Clone)]
 struct RmsNorm {
     eps: f32,
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     f32_math: bool,
 }
 
