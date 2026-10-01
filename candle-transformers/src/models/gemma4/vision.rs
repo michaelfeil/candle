@@ -541,9 +541,9 @@ impl VisionTower {
         })
     }
 
-    /// Encode a single image at its natural resolution.
+    /// Encode images sharing a resolution, preserving independent attention.
     fn encode_single(&self, pv: &Tensor, device: &Device) -> Result<Tensor> {
-        let (_, _, h, w) = pv.dims4()?;
+        let (batch, _, h, w) = pv.dims4()?;
         let ph = h / self.patch_size;
         let pw = w / self.patch_size;
         let num_patches = ph * pw;
@@ -556,8 +556,10 @@ impl VisionTower {
                 pos_data.push(row as i64);
             }
         }
-        let positions =
-            Tensor::from_vec(pos_data, (1, num_patches, 2), &Device::Cpu)?.to_device(device)?;
+        let positions = Tensor::from_vec(pos_data, (1, num_patches, 2), &Device::Cpu)?
+            .to_device(device)?
+            .broadcast_as((batch, num_patches, 2))?
+            .contiguous()?;
 
         let embeds = self.patch_embedder.forward(pv, &positions)?;
 
@@ -578,21 +580,57 @@ impl VisionTower {
             .pooler
             .forward(&hidden_states, &positions, Some(output_length))?;
 
-        pooled.squeeze(0)
+        pooled.flatten(0, 1)
+    }
+
+    /// Encode adjacent images of the same resolution in bounded GPU batches.
+    /// Output tokens retain the input image order.
+    pub fn forward_batched(&self, pixel_values_list: &[Tensor]) -> Result<Tensor> {
+        if pixel_values_list.is_empty() {
+            candle::bail!("Gemma4 vision requires at least one image");
+        }
+        let mut tokens = Vec::new();
+        let mut start = 0;
+        while start < pixel_values_list.len() {
+            let image = &pixel_values_list[start];
+            let (batch, _, height, width) = image.dims4()?;
+            if batch != 1 || height == 0 || width == 0 {
+                candle::bail!("Gemma4 vision expects individual nonempty images");
+            }
+            let patches = (height / self.patch_size) * (width / self.patch_size);
+            let limit = (9216 / patches.max(1)).clamp(1, 4);
+            let mut end = start + 1;
+            while end < pixel_values_list.len()
+                && end - start < limit
+                && pixel_values_list[end].dims() == image.dims()
+            {
+                end += 1;
+            }
+            let pixels = if end == start + 1 {
+                image.clone()
+            } else {
+                Tensor::cat(&pixel_values_list[start..end], 0)?
+            };
+            tokens.push(self.encode_single(&pixels, image.device())?);
+            start = end;
+        }
+        self.standardize(Tensor::cat(&tokens, 0)?)
     }
 
     /// Encode a batch of images (each may have different sizes).
     pub fn forward(&self, pixel_values_list: &[Tensor]) -> Result<Tensor> {
         let device = pixel_values_list[0].device().clone();
-        let dtype = self.patch_embedder.input_proj.weight().dtype();
 
         let mut all_tokens = Vec::with_capacity(pixel_values_list.len());
         for pv in pixel_values_list {
             let tokens = self.encode_single(pv, &device)?;
             all_tokens.push(tokens);
         }
-        let mut hidden_states = Tensor::cat(&all_tokens, 0)?;
+        self.standardize(Tensor::cat(&all_tokens, 0)?)
+    }
 
+    fn standardize(&self, mut hidden_states: Tensor) -> Result<Tensor> {
+        let dtype = self.patch_embedder.input_proj.weight().dtype();
         if let (Some(ref std_bias), Some(ref std_scale)) = (&self.std_bias, &self.std_scale) {
             let std_bias = std_bias
                 .to_device(hidden_states.device())?
@@ -732,4 +770,75 @@ mod rotary_tests {
         rotary_gradients_cuda,
         rotary_gradients_metal
     );
+}
+
+#[cfg(test)]
+mod batching_tests {
+    use super::*;
+    use candle_nn::VarMap;
+
+    fn compare_with_serial(device: Device) -> Result<()> {
+        let cfg: Gemma4VisionConfig = serde_json::from_value(serde_json::json!({
+            "hidden_size": 16, "intermediate_size": 32, "num_hidden_layers": 2,
+            "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 8,
+            "patch_size": 2, "pooling_kernel_size": 3, "position_embedding_size": 16,
+            "standardize": true
+        }))
+        .map_err(candle::Error::wrap)?;
+        let vars = VarMap::new();
+        let tower = VisionTower::new(&cfg, VarBuilder::from_varmap(&vars, DType::F32, &device))?;
+        for (name, var) in vars.data().lock().unwrap().iter() {
+            let offset = name.bytes().map(usize::from).sum::<usize>();
+            let values = (0..var.elem_count())
+                .map(|i| {
+                    let v = ((i * 31 + offset) % 101) as f32 / 100. - 0.5;
+                    if var.dims().len() == 1 {
+                        1. + v * 0.2
+                    } else {
+                        v * 0.2
+                    }
+                })
+                .collect::<Vec<_>>();
+            var.set(&Tensor::from_vec(values, var.shape(), &device)?)?;
+        }
+        let images = (0..9)
+            .map(|i| {
+                let width = if i == 5 { 12 } else { 6 };
+                let pixels = (0..3 * 6 * width)
+                    .map(|j| ((j * 17 + i * 23) % 101) as f32 / 100.)
+                    .collect::<Vec<_>>();
+                Tensor::from_vec(pixels, (1, 3, 6, width), &device)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for count in [1, 2, 4, 5, 9] {
+            let expected = tower.forward(&images[..count])?;
+            let actual = tower.forward_batched(&images[..count])?;
+            assert_eq!(actual.dims(), expected.dims());
+            let error = actual
+                .sub(&expected)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert!(error < 1e-4, "{count} images: max error {error}");
+            assert!(actual.abs()?.max_all()?.to_scalar::<f32>()? > 0.1);
+        }
+        // A neighbor's content must not change an image's features.
+        let together = tower.forward_batched(&images[..2])?;
+        let alone = tower.forward(&images[1..2])?;
+        let tokens = alone.dim(1)?;
+        let error = together
+            .narrow(1, tokens, tokens)?
+            .sub(&alone)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(error < 1e-4, "cross-image attention: {error}");
+        assert!(tower.forward_batched(&[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn batches_preserve_image_order_and_independent_attention() -> Result<()> {
+        compare_with_serial(Device::Cpu)
+    }
 }
