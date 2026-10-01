@@ -143,6 +143,48 @@ fn rms_norm_f32_math(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn rms_norm_f32_gradients(device: &Device) -> Result<()> {
+    use candle::{DType, Var, D};
+    for (track_x, track_alpha) in [(true, false), (false, true), (true, true)] {
+        let x_var = Var::from_vec(vec![1f32, -2., 3., 4., 5., -6.], (2, 3), device)?;
+        let alpha_var = Var::from_vec(vec![0.8f32, 1.2, 0.9], 3, device)?;
+        let x = if track_x {
+            x_var.as_tensor().clone()
+        } else {
+            x_var.detach()
+        };
+        let alpha = if track_alpha {
+            alpha_var.as_tensor().clone()
+        } else {
+            alpha_var.detach()
+        };
+        let variance = (x.sqr()?.sum_keepdim(D::Minus1)? / 3.)?;
+        let expected = x
+            .broadcast_div(&(variance + 1e-6)?.sqrt()?)?
+            .broadcast_mul(&alpha)?;
+        let actual = candle_nn::ops::rms_norm_f32(&x, &alpha, 1e-6)?;
+        let expected_grads = expected.sum_all()?.backward()?;
+        let actual_grads = actual.sum_all()?.backward()?;
+        for (tracked, var) in [(track_x, &x_var), (track_alpha, &alpha_var)] {
+            if tracked {
+                let expected_grad = expected_grads.get(var).expect("reference gradient");
+                let actual_grad = actual_grads.get(var).expect("gradient must be preserved");
+                assert_eq!(
+                    actual_grad
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    expected_grad
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn rms_norml(device: &Device) -> Result<()> {
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -452,3 +494,10 @@ test_device!(
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
+
+test_device!(
+    rms_norm_f32_gradients,
+    rms_norm_f32_gradients_cpu,
+    rms_norm_f32_gradients_gpu,
+    rms_norm_f32_gradients_metal
+);

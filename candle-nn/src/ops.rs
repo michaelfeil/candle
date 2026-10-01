@@ -708,7 +708,8 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
 }
 
 /// RMS normalization with float32 arithmetic and scaling before the output cast.
-/// CUDA uses the same reduction tree as the unfused float32 expression.
+/// CUDA inference uses the same reduction tree as the unfused float32 expression.
+/// Inputs requiring gradients use the composed expression to preserve autograd.
 pub fn rms_norm_f32(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     if xs.dim(D::Minus1)? == 0 || xs.dim(D::Minus1)? != alpha.dims1()? {
         candle::bail!(
@@ -720,7 +721,11 @@ pub fn rms_norm_f32(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     if xs.elem_count() == 0 {
         return Ok(xs.clone());
     }
-    if xs.device().is_cuda() && matches!(xs.dtype(), DType::F16 | DType::BF16 | DType::F32) {
+    if xs.device().is_cuda()
+        && !xs.track_op()
+        && !alpha.track_op()
+        && matches!(xs.dtype(), DType::F16 | DType::BF16 | DType::F32)
+    {
         return xs.apply_op2_no_bwd(
             alpha,
             &RmsNorm {
