@@ -603,6 +603,7 @@ impl VisionTower {
             while end < pixel_values_list.len()
                 && end - start < limit
                 && pixel_values_list[end].dims() == image.dims()
+                && pixel_values_list[end].dtype() == image.dtype()
             {
                 end += 1;
             }
@@ -822,6 +823,19 @@ mod batching_tests {
             assert!(error < 1e-4, "{count} images: max error {error}");
             assert!(actual.abs()?.max_all()?.to_scalar::<f32>()? > 0.1);
         }
+        let mixed_dtype = [
+            images[0].clone(),
+            images[1].to_dtype(DType::F16)?,
+            images[2].clone(),
+        ];
+        let expected = tower.forward(&mixed_dtype)?;
+        let actual = tower.forward_batched(&mixed_dtype)?;
+        let error = actual
+            .sub(&expected)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(error < 1e-4, "mixed input dtypes: {error}");
         // A neighbor's content must not change an image's features.
         let together = tower.forward_batched(&images[..2])?;
         let alone = tower.forward(&images[1..2])?;
