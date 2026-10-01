@@ -731,3 +731,27 @@ FAST_OP(double, fast_min_f64, fast_max_f64, fast_argmin_f64, fast_argmax_f64, fa
 FAST_OP(uint32_t, fast_min_u32, fast_max_u32, fast_argmin_u32, fast_argmax_u32, fast_sum_u32)
 FAST_OP(int64_t, fast_min_i64, fast_max_i64, fast_argmin_i64, fast_argmax_i64, fast_sum_i64)
 FAST_OP(uint8_t, fast_min_u8, fast_max_u8, fast_argmin_u8, fast_argmax_u8, fast_sum_u8)
+
+template<typename T>
+__device__ void gemma4_rope2d(const T* x,const T* c,const T* s,T* out,uint64_t total,uint32_t heads,uint32_t tokens,uint32_t dim,uint64_t sb,uint64_t sh,uint64_t st,uint64_t sd) {
+ uint64_t i=(uint64_t)blockIdx.x*blockDim.x+threadIdx.x;
+ if(i>=total)return;
+ uint32_t d=i%dim,t=(i/dim)%tokens,h=(i/(dim*tokens))%heads;
+ uint64_t b=i/((uint64_t)dim*tokens*heads);
+ uint32_t axis=d%(dim/2),partner=axis<dim/4?d+dim/4:d-dim/4;
+ uint64_t offset=b*sb+h*sh+t*st;
+ float a=float(x[offset+d*sd]);
+ float z=float(x[offset+partner*sd]);
+ if(axis<dim/4)z=-z;
+ uint64_t cs=(b*tokens+t)*dim+d;
+ // Preserve the two input-dtype product roundings before adding.
+ T p=T(__fmul_rn(a,float(c[cs])));
+ T q=T(__fmul_rn(z,float(s[cs])));
+ out[i]=T(__fadd_rn(float(p),float(q)));
+}
+#define GEMMA4_ROPE2D_EXPORT(T,N) extern "C" __global__ void N(const T*x,const T*c,const T*s,T*out,uint64_t total,uint32_t heads,uint32_t tokens,uint32_t dim,uint64_t sb,uint64_t sh,uint64_t st,uint64_t sd){gemma4_rope2d(x,c,s,out,total,heads,tokens,dim,sb,sh,st,sd);}
+GEMMA4_ROPE2D_EXPORT(float,gemma4_rope2d_f32)
+GEMMA4_ROPE2D_EXPORT(__half,gemma4_rope2d_f16)
+#if __CUDA_ARCH__ >= 800
+GEMMA4_ROPE2D_EXPORT(__nv_bfloat16,gemma4_rope2d_bf16)
+#endif

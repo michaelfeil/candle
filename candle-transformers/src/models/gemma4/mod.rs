@@ -212,3 +212,6 @@ fn broadcast_embed_to_mask(embeds: &Tensor, mask: &Tensor) -> Result<Tensor> {
 
     Ok(zeros)
 }
+
+#[cfg(feature = "cuda")]
+mod precise_rope;

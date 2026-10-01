@@ -101,6 +101,22 @@ fn rotate_half(x: &Tensor) -> Result<Tensor> {
 }
 
 fn apply_2d_rope(x: &Tensor, cos: &Tensor, sin: &Tensor, ndim: usize) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda()
+        && ndim == 2
+        && x.elem_count() != 0
+        && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
+        && !x.track_op()
+        && !cos.track_op()
+        && !sin.track_op()
+    {
+        return super::precise_rope::apply(x, cos, sin);
+    }
+
+    apply_2d_rope_slow(x, cos, sin, ndim)
+}
+
+fn apply_2d_rope_slow(x: &Tensor, cos: &Tensor, sin: &Tensor, ndim: usize) -> Result<Tensor> {
     let head_dim = x.dim(D::Minus1)?;
     let dim_per_dim = head_dim / ndim;
     let cos = cos.unsqueeze(1)?;
@@ -589,4 +605,131 @@ impl VisionTower {
 
         hidden_states.to_dtype(dtype)?.unsqueeze(0)
     }
+}
+
+#[cfg(test)]
+mod rotary_tests {
+    use super::{apply_2d_rope, apply_2d_rope_slow};
+    use candle::{test_device, DType, Device, Result, Tensor, Var};
+
+    fn exact_rotary(device: &Device) -> Result<()> {
+        for dtype in [DType::BF16, DType::F16, DType::F32] {
+            for d in [72, 128] {
+                for (b, t) in [(1, 3), (2, 17), (1, 2304)] {
+                    for strided_last in [false, true] {
+                        let h = 2;
+                        let values = (0..(b + 1) * t * h * d)
+                            .map(|i| ((i * 31 % 199) as f32 - 99.) / 33.)
+                            .collect::<Vec<_>>();
+                        let x = if strided_last {
+                            Tensor::from_vec(values, (b + 1, t, d, h), device)?.transpose(2, 3)?
+                        } else {
+                            Tensor::from_vec(values, (b + 1, t, h, d), device)?
+                        }
+                        .to_dtype(dtype)?
+                        .narrow(0, 1, b)?
+                        .transpose(1, 2)?;
+                        let angles = (0..(b + 1) * t * d)
+                            .map(|i| {
+                                let coord = i % d;
+                                ((i / d) * 7 + (coord % (d / 4)) * 3 + (coord / (d / 2)) * 11)
+                                    as f32
+                                    / 13.
+                            })
+                            .collect::<Vec<_>>();
+                        let angles = Tensor::from_vec(angles, (b + 1, t, d), device)?;
+                        let cos = angles.cos()?.to_dtype(dtype)?.narrow(0, 1, b)?;
+                        let sin = angles.sin()?.to_dtype(dtype)?.narrow(0, 1, b)?;
+                        let reference = apply_2d_rope_slow(&x, &cos, &sin, 2)?
+                            .to_dtype(DType::F32)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?;
+                        let actual = apply_2d_rope(&x, &cos, &sin, 2)?
+                            .to_dtype(DType::F32)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?;
+                        assert!(actual == reference, "{dtype:?}, dim {d}, batch {b}, tokens {t}, strided last {strided_last}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn rotary_gradients(device: &Device) -> Result<()> {
+        for (track_x, track_cos, track_sin) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let x_var = Var::from_vec(
+                (0..432).map(|i| (i % 17) as f32 / 11.).collect::<Vec<_>>(),
+                (1, 3, 2, 72),
+                device,
+            )?;
+            let cos_var = Var::from_vec(
+                (0..216).map(|i| (i as f32 / 13.).cos()).collect::<Vec<_>>(),
+                (1, 3, 72),
+                device,
+            )?;
+            let sin_var = Var::from_vec(
+                (0..216).map(|i| (i as f32 / 13.).sin()).collect::<Vec<_>>(),
+                (1, 3, 72),
+                device,
+            )?;
+            let x = if track_x {
+                x_var.as_tensor().clone()
+            } else {
+                x_var.detach()
+            }
+            .transpose(1, 2)?;
+            let cos = if track_cos {
+                cos_var.as_tensor().clone()
+            } else {
+                cos_var.detach()
+            };
+            let sin = if track_sin {
+                sin_var.as_tensor().clone()
+            } else {
+                sin_var.detach()
+            };
+            let reference = apply_2d_rope_slow(&x, &cos, &sin, 2)?
+                .sum_all()?
+                .backward()?;
+            let actual = apply_2d_rope(&x, &cos, &sin, 2)?.sum_all()?.backward()?;
+            for (tracked, var) in [
+                (track_x, &x_var),
+                (track_cos, &cos_var),
+                (track_sin, &sin_var),
+            ] {
+                if tracked {
+                    let a = actual
+                        .get(var)
+                        .expect("rotary gradient must be preserved")
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let e = reference
+                        .get(var)
+                        .expect("reference gradient")
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    assert!(a == e, "rotary gradient differs");
+                }
+            }
+        }
+        Ok(())
+    }
+    test_device!(
+        exact_rotary,
+        exact_rotary_cpu,
+        exact_rotary_cuda,
+        exact_rotary_metal
+    );
+    test_device!(
+        rotary_gradients,
+        rotary_gradients_cpu,
+        rotary_gradients_cuda,
+        rotary_gradients_metal
+    );
 }
