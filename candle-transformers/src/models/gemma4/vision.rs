@@ -201,6 +201,7 @@ struct VisionAttention {
     o_proj: Linear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
+    v_norm_weight: Tensor,
     rms_norm_eps: f64,
     num_heads: usize,
     num_kv_heads: usize,
@@ -230,6 +231,7 @@ impl VisionAttention {
             o_proj,
             q_norm,
             k_norm,
+            v_norm_weight: Tensor::ones(head_dim, vb.dtype(), vb.device())?,
             rms_norm_eps: cfg.rms_norm_eps,
             num_heads,
             num_kv_heads,
@@ -252,7 +254,17 @@ impl VisionAttention {
         // Q/K norms and V norm
         q = self.q_norm.forward(&q)?;
         k = self.k_norm.forward(&k)?;
-        let v = v_norm(&v, self.rms_norm_eps)?.transpose(1, 2)?;
+        let v =
+            if v.device().is_cuda() && matches!(v.dtype(), DType::F16 | DType::BF16 | DType::F32) {
+                candle_nn::ops::rms_norm_f32(
+                    &v.contiguous()?,
+                    &self.v_norm_weight,
+                    self.rms_norm_eps as f32,
+                )?
+            } else {
+                v_norm(&v, self.rms_norm_eps)?
+            }
+            .transpose(1, 2)?;
 
         // Transpose to (b, heads, seq, head_dim) for RoPE
         q = q.transpose(1, 2)?;
