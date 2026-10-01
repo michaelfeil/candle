@@ -77,6 +77,56 @@ fn rms_norm(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn rms_norm_f32_math(device: &Device) -> Result<()> {
+    use candle::{DType, D};
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        for cols in [3, 17, 72, 128, 512, 1024, 1152, 4096] {
+            let values = (0..7 * cols)
+                .map(|i| {
+                    if i < 2 * cols {
+                        0.
+                    } else {
+                        ((i * 31 % 199) as f32 - 99.) / 33.
+                    }
+                })
+                .collect::<Vec<_>>();
+            // Exercise storage offsets as well as zero-input rows.
+            let tensor = Tensor::from_vec(values, (7, cols), device)?
+                .to_dtype(dtype)?
+                .narrow(0, 1, 5)?;
+            let weights = (0..cols)
+                .map(|i| 0.85 + (i % 11) as f32 * 0.037)
+                .collect::<Vec<_>>();
+            let alpha = Tensor::from_vec(weights, cols, device)?.to_dtype(dtype)?;
+            let x = tensor.to_dtype(DType::F32)?;
+            let variance = (x.sqr()?.sum_keepdim(D::Minus1)? / cols as f64)?;
+            let expected = x
+                .broadcast_div(&(variance + 1e-6)?.sqrt()?)?
+                .broadcast_mul(&alpha.to_dtype(DType::F32)?)?
+                .to_dtype(dtype)?;
+            let actual = candle_nn::ops::rms_norm_f32(&tensor, &alpha, 1e-6)?;
+            assert_eq!(
+                actual
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                expected
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                "{dtype:?} width {cols}"
+            );
+        }
+    }
+    assert!(candle_nn::ops::rms_norm_f32(
+        &Tensor::zeros((1, 0), candle::DType::F32, device)?,
+        &Tensor::zeros(0, candle::DType::F32, device)?,
+        1e-6
+    )
+    .is_err());
+    Ok(())
+}
+
 fn rms_norml(device: &Device) -> Result<()> {
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -370,6 +420,12 @@ test_device!(rope, rope_cpu, rope_gpu, rope_metal);
 test_device!(rope_thd, rope_thd_cpu, rope_thd_gpu, rope_thd_metal);
 test_device!(softmax, softmax_cpu, softmax_gpu, softmax_metal);
 test_device!(rms_norm, rms_norm_cpu, rms_norm_gpu, rms_norm_metal);
+test_device!(
+    rms_norm_f32_math,
+    rms_norm_f32_math_cpu,
+    rms_norm_f32_math_gpu,
+    rms_norm_f32_math_metal
+);
 test_device!(rms_norml, rms_norml_cpu, rms_norml_gpu, rms_norml_metal);
 test_device!(
     rms_norm_large_magnitude,

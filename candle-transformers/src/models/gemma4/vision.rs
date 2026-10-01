@@ -25,6 +25,13 @@ impl RmsNorm {
 
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if x.device().is_cuda() && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32) {
+            return candle_nn::ops::rms_norm_f32(
+                &x.contiguous()?,
+                &self.weight.to_dtype(x.dtype())?,
+                self.eps as f32,
+            );
+        }
         let x_dtype = x.dtype();
         let internal_dtype = match x_dtype {
             DType::F16 | DType::BF16 => DType::F32,

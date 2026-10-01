@@ -183,6 +183,35 @@ __device__ void layernorm(const T * x, T * dst, const T * alpha, const T * beta,
     }
 }
 
+// Match the float32 square/reduce/divide/scale path, including its reduction tree.
+// Apply the learned scale before the final low precision cast.
+template <typename T>
+__device__ void rmsnorm_f32_math(const T *x, T *dst, const T *alpha,
+                               const int ncols, const int block_size, const float eps) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float sums[BLOCK_SIZE];
+    float sum = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float value = static_cast<float>(x[row * ncols + col]);
+        sum = __fadd_rn(sum, __fmul_rn(value, value));
+    }
+    sums[tid] = sum;
+    for (int stride = block_size / 2; stride > 0; stride >>= 1) {
+        __syncthreads();
+        if (tid < stride) sums[tid] = __fadd_rn(sums[tid], sums[tid + stride]);
+    }
+    __syncthreads();
+    const float variance = __fadd_rn(
+        __fmul_rn(sums[0], static_cast<float>(1.0 / static_cast<double>(ncols))), eps);
+    const float denominator = sqrtf(variance);
+    for (int col = tid; col < ncols; col += block_size) {
+        const float normalized = static_cast<float>(x[row * ncols + col]) / denominator;
+        dst[row * ncols + col] = static_cast<T>(
+            __fmul_rn(normalized, static_cast<float>(alpha[col])));
+    }
+}
+
 // RmsNorm implementation adapted from ggml, accumulation is made using f32.
 // https://github.com/ggerganov/llama.cpp/blob/d59bd97065cd7ded6c4ecab54b1d5e0b1b11e318/ggml-cuda.cu#L523
 template <typename T>
@@ -605,6 +634,13 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
     rmsnorm<TYPENAME>(src, dst, alpha, n_cols, block_size, eps);               \
   }                                                                            \
 
+#define RMSNORM_F32_MATH_OP(TYPENAME, FN_NAME) \
+  extern "C" __global__ void FN_NAME( \
+      const TYPENAME *src, TYPENAME *dst, const TYPENAME *alpha, \
+      const int n_cols, const int block_size, const float eps) { \
+    rmsnorm_f32_math<TYPENAME>(src, dst, alpha, n_cols, block_size, eps); \
+  }
+
 #define LAYERNORM_OP(TYPENAME, FN_NAME) \
   extern "C" __global__ void FN_NAME(                                          \
       const TYPENAME *src, TYPENAME *dst, const TYPENAME *alpha,               \
@@ -650,6 +686,7 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
 #if __CUDA_ARCH__ >= 800
 SOFTMAX_OP(__nv_bfloat16, float, softmax_bf16)
 RMSNORM_OP(__nv_bfloat16, rmsnorm_bf16)
+RMSNORM_F32_MATH_OP(__nv_bfloat16, rmsnorm_f32_math_bf16)
 LAYERNORM_OP(__nv_bfloat16, layernorm_bf16)
 ROPE_OP(__nv_bfloat16, rope_bf16, rope_i_bf16, rope_thd_bf16)
 SUM_OP(__nv_bfloat16, sum_bf16)
@@ -667,6 +704,7 @@ FAST_OP(__nv_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16, fast_argm
 #if __CUDA_ARCH__ >= 530
 SOFTMAX_OP(__half, float, softmax_f16)
 RMSNORM_OP(__half, rmsnorm_f16)
+RMSNORM_F32_MATH_OP(__half, rmsnorm_f32_math_f16)
 LAYERNORM_OP(__half, layernorm_f16)
 ROPE_OP(__half, rope_f16, rope_i_f16, rope_thd_f16)
 SUM_OP(__half, sum_f16)
@@ -679,6 +717,7 @@ SUM_OP(uint32_t, sum_u32)
 SOFTMAX_OP(float, float, softmax_f32)
 SOFTMAX_OP(double, double, softmax_f64)
 RMSNORM_OP(float, rmsnorm_f32)
+RMSNORM_F32_MATH_OP(float, rmsnorm_f32_math_f32)
 RMSNORM_OP(double, rmsnorm_f64)
 LAYERNORM_OP(float, layernorm_f32)
 LAYERNORM_OP(double, layernorm_f64)
