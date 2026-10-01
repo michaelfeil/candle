@@ -722,6 +722,9 @@ pub fn rms_norm_f32(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
         return Ok(xs.clone());
     }
     if xs.device().is_cuda()
+        && xs.is_contiguous()
+        && alpha.is_contiguous()
+        && xs.dtype() == alpha.dtype()
         && !xs.track_op()
         && !alpha.track_op()
         && matches!(xs.dtype(), DType::F16 | DType::BF16 | DType::F32)

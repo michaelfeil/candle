@@ -126,6 +126,41 @@ fn rms_norm_f32_math(device: &Device) -> Result<()> {
             );
         }
     }
+    for dtype in [DType::F16, DType::BF16, DType::F32] {
+        for alpha_dtype in [DType::F16, DType::BF16, DType::F32] {
+            let tensor = Tensor::new(&[[1f32, -2., 3.]], device)?.to_dtype(dtype)?;
+            let alpha = Tensor::new(&[0.87f32, 1.13, 1.97], device)?.to_dtype(alpha_dtype)?;
+            let x = tensor.to_dtype(DType::F32)?;
+            let variance = (x.sqr()?.sum_keepdim(D::Minus1)? / 3.)?;
+            let expected = x
+                .broadcast_div(&(variance + 1e-6)?.sqrt()?)?
+                .broadcast_mul(&alpha.to_dtype(DType::F32)?)?
+                .to_dtype(dtype)?;
+            let actual = candle_nn::ops::rms_norm_f32(&tensor, &alpha, 1e-6)?;
+            assert_eq!(
+                actual
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                expected
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                "input {dtype:?}, alpha {alpha_dtype:?}"
+            );
+        }
+    }
+    let tensor = Tensor::new(&[[1f32, -2., 3.], [4., 5., -6.]], device)?.t()?;
+    let alpha = Tensor::new(&[[0.87f32, 1.], [1.13, 1.]], device)?.i((.., 0))?;
+    let variance = (tensor.sqr()?.sum_keepdim(D::Minus1)? / 2.)?;
+    let expected = tensor
+        .broadcast_div(&(variance + 1e-6)?.sqrt()?)?
+        .broadcast_mul(&alpha)?;
+    let actual = candle_nn::ops::rms_norm_f32(&tensor, &alpha, 1e-6)?;
+    assert_eq!(
+        actual.flatten_all()?.to_vec1::<f32>()?,
+        expected.flatten_all()?.to_vec1::<f32>()?
+    );
     for shape in [(0, 72), (0, 1152)] {
         let empty = Tensor::zeros(shape, DType::F32, device)?;
         let alpha = Tensor::ones(shape.1, DType::F32, device)?;
@@ -181,6 +216,28 @@ fn rms_norm_f32_gradients(device: &Device) -> Result<()> {
                 );
             }
         }
+    }
+    // Empty binary operations already return the left input without tracking alpha.
+    // Compare the actual graph to the existing composed expression on CPU.
+    if device.is_cpu() {
+        let x = Var::zeros((0, 3), DType::F32, device)?;
+        let alpha = Var::ones(3, DType::F32, device)?;
+        let variance = (x.sqr()?.sum_keepdim(D::Minus1)? / 3.)?;
+        let reference = x
+            .broadcast_div(&(variance + 1e-6)?.sqrt()?)?
+            .broadcast_mul(&alpha)?;
+        let reference_grads = reference.sum_all()?.backward()?;
+        let output = candle_nn::ops::rms_norm_f32(&x, &alpha, 1e-6)?;
+        let actual_grads = output.sum_all()?.backward()?;
+        assert!(reference_grads.get(&alpha).is_none());
+        assert!(actual_grads.get(&alpha).is_none());
+        assert_eq!(
+            actual_grads.get(&x).expect("empty input gradient").dims(),
+            reference_grads
+                .get(&x)
+                .expect("reference empty input gradient")
+                .dims()
+        );
     }
     Ok(())
 }
