@@ -441,6 +441,7 @@ pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
 #[derive(Debug, Clone)]
 struct RmsNorm {
     eps: f32,
+    f32_math: bool,
 }
 
 impl candle::CustomOp2 for RmsNorm {
@@ -554,6 +555,7 @@ impl candle::CustomOp2 for RmsNorm {
 
         struct S {
             eps: f32,
+            f32_math: bool,
         }
         impl Map2 for S {
             fn f<T: DeviceRepr + WithDType>(
@@ -577,13 +579,24 @@ impl candle::CustomOp2 for RmsNorm {
                 let dim_m1 = dims[dims.len() - 1];
                 let (n_rows, n_cols) = (el / dim_m1, dim_m1);
 
-                let block_size = if n_cols < 1024 { 32 } else { 1024 };
+                let block_size = if self.f32_math {
+                    n_cols.min(1024).next_power_of_two() as u32
+                } else if n_cols < 1024 {
+                    32
+                } else {
+                    1024
+                };
                 let cfg = LaunchConfig {
                     grid_dim: (n_rows as u32, 1, 1),
                     block_dim: (block_size, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let func = dev.get_or_load_func(&kernel_name::<T>("rmsnorm"), &kernels::REDUCE)?;
+                let name = if self.f32_math {
+                    "rmsnorm_f32_math"
+                } else {
+                    "rmsnorm"
+                };
+                let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::REDUCE)?;
                 // SAFETY: Set later by running the kernel.
                 let dst = unsafe { dev.alloc::<T>(el)? };
                 let mut builder = func.builder();
@@ -599,7 +612,11 @@ impl candle::CustomOp2 for RmsNorm {
 
         use candle::backend::BackendStorage;
         let dev = s1.device();
-        let slice = S { eps: self.eps }.map(&s1.slice, l1, &s2.slice, l2, dev)?;
+        let slice = S {
+            eps: self.eps,
+            f32_math: self.f32_math,
+        }
+        .map(&s1.slice, l1, &s2.slice, l2, dev)?;
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
@@ -681,7 +698,50 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
             alpha.shape()
         )
     }
-    xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
+    xs.apply_op2_no_bwd(
+        alpha,
+        &RmsNorm {
+            eps,
+            f32_math: false,
+        },
+    )
+}
+
+/// RMS normalization with float32 arithmetic and scaling before the output cast.
+/// CUDA inference uses the same reduction tree as the unfused float32 expression.
+/// Inputs requiring gradients use the composed expression to preserve autograd.
+pub fn rms_norm_f32(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
+    if xs.dim(D::Minus1)? == 0 || xs.dim(D::Minus1)? != alpha.dims1()? {
+        candle::bail!(
+            "shape mismatch in rms-norm {:?} {:?}",
+            xs.shape(),
+            alpha.shape()
+        )
+    }
+    if xs.elem_count() == 0 {
+        return Ok(xs.clone());
+    }
+    if xs.device().is_cuda()
+        && xs.is_contiguous()
+        && alpha.is_contiguous()
+        && xs.dtype() == alpha.dtype()
+        && !xs.track_op()
+        && !alpha.track_op()
+        && matches!(xs.dtype(), DType::F16 | DType::BF16 | DType::F32)
+    {
+        return xs.apply_op2_no_bwd(
+            alpha,
+            &RmsNorm {
+                eps,
+                f32_math: true,
+            },
+        );
+    }
+    let x = xs.to_dtype(DType::F32)?;
+    let variance = (x.sqr()?.sum_keepdim(D::Minus1)? / x.dim(D::Minus1)? as f64)?;
+    x.broadcast_div(&(variance + eps as f64)?.sqrt()?)?
+        .broadcast_mul(&alpha.to_dtype(DType::F32)?)?
+        .to_dtype(xs.dtype())
 }
 
 #[derive(Debug, Clone)]

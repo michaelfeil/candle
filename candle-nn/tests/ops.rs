@@ -77,6 +77,171 @@ fn rms_norm(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn rms_norm_f32_math(device: &Device) -> Result<()> {
+    use candle::{DType, D};
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        for cols in [3, 17, 72, 128, 512, 1024, 1152, 4096] {
+            let values = (0..7 * cols)
+                .map(|i| {
+                    if i < 2 * cols {
+                        0.
+                    } else if i / cols == 2 {
+                        // Sum 17 distinguishes rounded reciprocal multiplication from
+                        // float32 division at widths 72 and 1152.
+                        if i % cols < 17 {
+                            1.
+                        } else {
+                            0.
+                        }
+                    } else {
+                        ((i * 31 % 199) as f32 - 99.) / 33.
+                    }
+                })
+                .collect::<Vec<_>>();
+            // Exercise storage offsets as well as zero-input rows.
+            let tensor = Tensor::from_vec(values, (7, cols), device)?
+                .to_dtype(dtype)?
+                .narrow(0, 1, 5)?;
+            let weights = (0..cols)
+                .map(|i| 0.85 + (i % 11) as f32 * 0.037)
+                .collect::<Vec<_>>();
+            let alpha = Tensor::from_vec(weights, cols, device)?.to_dtype(dtype)?;
+            let x = tensor.to_dtype(DType::F32)?;
+            let variance = (x.sqr()?.sum_keepdim(D::Minus1)? / cols as f64)?;
+            let expected = x
+                .broadcast_div(&(variance + 1e-6)?.sqrt()?)?
+                .broadcast_mul(&alpha.to_dtype(DType::F32)?)?
+                .to_dtype(dtype)?;
+            let actual = candle_nn::ops::rms_norm_f32(&tensor, &alpha, 1e-6)?;
+            assert_eq!(
+                actual
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                expected
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                "{dtype:?} width {cols}"
+            );
+        }
+    }
+    for dtype in [DType::F16, DType::BF16, DType::F32] {
+        for alpha_dtype in [DType::F16, DType::BF16, DType::F32] {
+            let tensor = Tensor::new(&[[1f32, -2., 3.]], device)?.to_dtype(dtype)?;
+            let alpha = Tensor::new(&[0.87f32, 1.13, 1.97], device)?.to_dtype(alpha_dtype)?;
+            let x = tensor.to_dtype(DType::F32)?;
+            let variance = (x.sqr()?.sum_keepdim(D::Minus1)? / 3.)?;
+            let expected = x
+                .broadcast_div(&(variance + 1e-6)?.sqrt()?)?
+                .broadcast_mul(&alpha.to_dtype(DType::F32)?)?
+                .to_dtype(dtype)?;
+            let actual = candle_nn::ops::rms_norm_f32(&tensor, &alpha, 1e-6)?;
+            assert_eq!(
+                actual
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                expected
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                "input {dtype:?}, alpha {alpha_dtype:?}"
+            );
+        }
+    }
+    let tensor = Tensor::new(&[[1f32, -2., 3.], [4., 5., -6.]], device)?.t()?;
+    let alpha = Tensor::new(&[[0.87f32, 1.], [1.13, 1.]], device)?.i((.., 0))?;
+    let variance = (tensor.sqr()?.sum_keepdim(D::Minus1)? / 2.)?;
+    let expected = tensor
+        .broadcast_div(&(variance + 1e-6)?.sqrt()?)?
+        .broadcast_mul(&alpha)?;
+    let actual = candle_nn::ops::rms_norm_f32(&tensor, &alpha, 1e-6)?;
+    assert_eq!(
+        actual.flatten_all()?.to_vec1::<f32>()?,
+        expected.flatten_all()?.to_vec1::<f32>()?
+    );
+    for shape in [(0, 72), (0, 1152)] {
+        let empty = Tensor::zeros(shape, DType::F32, device)?;
+        let alpha = Tensor::ones(shape.1, DType::F32, device)?;
+        assert_eq!(
+            candle_nn::ops::rms_norm_f32(&empty, &alpha, 1e-6)?.dims(),
+            empty.dims()
+        );
+    }
+    assert!(candle_nn::ops::rms_norm_f32(
+        &Tensor::zeros((1, 0), candle::DType::F32, device)?,
+        &Tensor::zeros(0, candle::DType::F32, device)?,
+        1e-6
+    )
+    .is_err());
+    Ok(())
+}
+
+fn rms_norm_f32_gradients(device: &Device) -> Result<()> {
+    use candle::{DType, Var, D};
+    for (track_x, track_alpha) in [(true, false), (false, true), (true, true)] {
+        let x_var = Var::from_vec(vec![1f32, -2., 3., 4., 5., -6.], (2, 3), device)?;
+        let alpha_var = Var::from_vec(vec![0.8f32, 1.2, 0.9], 3, device)?;
+        let x = if track_x {
+            x_var.as_tensor().clone()
+        } else {
+            x_var.detach()
+        };
+        let alpha = if track_alpha {
+            alpha_var.as_tensor().clone()
+        } else {
+            alpha_var.detach()
+        };
+        let variance = (x.sqr()?.sum_keepdim(D::Minus1)? / 3.)?;
+        let expected = x
+            .broadcast_div(&(variance + 1e-6)?.sqrt()?)?
+            .broadcast_mul(&alpha)?;
+        let actual = candle_nn::ops::rms_norm_f32(&x, &alpha, 1e-6)?;
+        let expected_grads = expected.sum_all()?.backward()?;
+        let actual_grads = actual.sum_all()?.backward()?;
+        for (tracked, var) in [(track_x, &x_var), (track_alpha, &alpha_var)] {
+            if tracked {
+                let expected_grad = expected_grads.get(var).expect("reference gradient");
+                let actual_grad = actual_grads.get(var).expect("gradient must be preserved");
+                assert_eq!(
+                    actual_grad
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    expected_grad
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?
+                );
+            }
+        }
+    }
+    // Empty binary operations already return the left input without tracking alpha.
+    // Compare the actual graph to the existing composed expression on CPU.
+    if device.is_cpu() {
+        let x = Var::zeros((0, 3), DType::F32, device)?;
+        let alpha = Var::ones(3, DType::F32, device)?;
+        let variance = (x.sqr()?.sum_keepdim(D::Minus1)? / 3.)?;
+        let reference = x
+            .broadcast_div(&(variance + 1e-6)?.sqrt()?)?
+            .broadcast_mul(&alpha)?;
+        let reference_grads = reference.sum_all()?.backward()?;
+        let output = candle_nn::ops::rms_norm_f32(&x, &alpha, 1e-6)?;
+        let actual_grads = output.sum_all()?.backward()?;
+        assert!(reference_grads.get(&alpha).is_none());
+        assert!(actual_grads.get(&alpha).is_none());
+        assert_eq!(
+            actual_grads.get(&x).expect("empty input gradient").dims(),
+            reference_grads
+                .get(&x)
+                .expect("reference empty input gradient")
+                .dims()
+        );
+    }
+    Ok(())
+}
+
 fn rms_norml(device: &Device) -> Result<()> {
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -370,6 +535,12 @@ test_device!(rope, rope_cpu, rope_gpu, rope_metal);
 test_device!(rope_thd, rope_thd_cpu, rope_thd_gpu, rope_thd_metal);
 test_device!(softmax, softmax_cpu, softmax_gpu, softmax_metal);
 test_device!(rms_norm, rms_norm_cpu, rms_norm_gpu, rms_norm_metal);
+test_device!(
+    rms_norm_f32_math,
+    rms_norm_f32_math_cpu,
+    rms_norm_f32_math_gpu,
+    rms_norm_f32_math_metal
+);
 test_device!(rms_norml, rms_norml_cpu, rms_norml_gpu, rms_norml_metal);
 test_device!(
     rms_norm_large_magnitude,
@@ -380,3 +551,10 @@ test_device!(
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
+
+test_device!(
+    rms_norm_f32_gradients,
+    rms_norm_f32_gradients_cpu,
+    rms_norm_f32_gradients_gpu,
+    rms_norm_f32_gradients_metal
+);
